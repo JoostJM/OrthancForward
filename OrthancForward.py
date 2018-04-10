@@ -96,8 +96,8 @@ def config_logger(**log_config):
 
   if 'Log_File' in log_config:
     if not os.path.isdir(os.path.dirname(log_config['Log_File'])):
-      Logger.warning('could not find directory for Log, storing in current folder')
-      log_config['Log_File'] = os.path.basename(log_config['Log_File'])
+      os.makedirs(os.path.dirname(log_config['Log_File']))
+      Logger.info('Creating directory for log files at "%s"', os.path.abspath(os.path.dirname(log_config['Log_File'])))
 
     handler = logging.handlers.TimedRotatingFileHandler(log_config['Log_File'], when='midnight', backupCount=7)
     handler.setFormatter(formatter)
@@ -106,11 +106,11 @@ def config_logger(**log_config):
 
   if 'UID_Log' in log_config:
     UIDlogger.setLevel(logging.INFO)
-    
+
     if not os.path.isdir(os.path.dirname(log_config['UID_Log'])):
-      Logger.warning('could not find directory for UID Log, storing in current folder')
-      log_config['UID_Log'] = os.path.basename(log_config['UID_Log'])
-    
+      os.makedirs(os.path.dirname(log_config['UID_Log']))
+      Logger.info('Creating directory for log files at "%s"', os.path.abspath(os.path.dirname(log_config['UID_Log'])))
+
     Logger.info('Adding handler for storing Slice SOP Instance UIDs (file: "%s")', log_config['UID_Log'])
     # Add a handler to store UIDs in separate Log file
     # Use a file handler (this will keep growing indefinitely, but only contains the UIDs of each series)
@@ -312,5 +312,4 @@ def _storeProgress(config):
 
 
 if __name__ == '__main__':
-  #main()
-  main(['Orthanc_Forward_settings.json', '--dry-run'])
+  main()
