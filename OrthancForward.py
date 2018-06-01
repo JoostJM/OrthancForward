@@ -8,11 +8,13 @@
 
 import argparse
 import base64
+import datetime
 import json
 import os
 import logging
 import logging.handlers
 import time
+import re
 
 import six
 from six.moves.urllib.request import Request, urlopen
@@ -23,10 +25,12 @@ DEBUG_MODE = False
 MAX_TRIES = 5
 CONFIG_FILE = None
 
-Logger = logging.getLogger('sedi_forward.events')
-UIDlogger = logging.getLogger('sedi_forward.UIDs')
+Logger = logging.getLogger('orthanc_forward.events')
+UIDlogger = logging.getLogger('orthanc_forward.UIDs')
 
-class OrthancInterface():
+pacscrawlerdb = None
+
+class OrthancInterface:
   """
   Interface class to handle RestAPI calls to the Orthanc server
   """
@@ -35,7 +39,7 @@ class OrthancInterface():
     self.URL = URL
     self.user = user
     self.password = password
-    self.logger = logging.getLogger('sedi_forward.events.interface')
+    self.logger = logging.getLogger('orthanc_forward.events.interface')
 
   def getResponse(self, cmd):
     req = Request('%s%s' % (self.URL, cmd))
@@ -68,10 +72,200 @@ class OrthancInterface():
       raise
 
 
+class PacsCrawlerInterface:
+
+  def __init__(self, **config):
+    from pacscrawler import data_connection
+
+    self.logger = logging.getLogger('orthanc_forward.events.pacscrawler')
+    self.config = config
+    self.data_connection = data_connection
+
+    self.connection = None
+    self.queries = None
+
+    self.required_queries = {"get_identity_patient",
+                             "get_identity_study",
+                             "get_identity_series",
+                             "get_patient",
+                             "get_study",
+                             "get_series",
+                             "insert_patient",
+                             "insert_patientid",
+                             "insert_study",
+                             "insert_study_keys",
+                             "insert_series",
+                             "insert_series_keys"}
+
+  def _init_connection(self):
+    db_connectiontype = self.config['Database_Connection'].get('Type', 'N/A')
+
+    self.connection = self.data_connection.getConnection(db_connectiontype, self.config.get('Database_Connection', {}))
+
+    if self.connection is None:
+      return 1
+
+    self.queries = self.connection.queries
+
+    if len(self.required_queries - set(self.queries.keys())) > 0:
+      self.logger.error('Missing required queries %s in database connection type %s, exiting',
+                        list(self.required_queries - set(self.queries.keys())), db_connectiontype)
+      return 2
+
+    return 0
+
+  def process_new_series(self, change, series, interface):
+    try:
+      if self._init_connection() > 0:
+        return
+
+      self.logger.info('forwarding new series (Change %i) to pacscrawler database...', change['Seq'])
+
+      study = interface.getResponse('/studies/%s' % series['ParentStudy'])
+      patient = interface.getResponse('/patients/%s' % study['ParentPatient'])
+
+      seriesTags = series.get('MainDicomTags', {})
+      studyTags = study.get('MainDicomTags', {})
+      patientTags = patient.get('MainDicomTags', {})
+
+      with self.connection:
+        pc_patient = self._get_patient(patientTags, change)
+        if pc_patient is None:
+          self.connection.rollback()
+          return
+
+        pc_study = self._get_study(pc_patient, studyTags, change)
+        if pc_study is None:
+          self.connection.rollback()
+          return
+
+        pc_series = self._get_series(pc_study, seriesTags, change)
+        if pc_series is None:
+          self.connection.rollback()
+          return
+
+    except Exception:
+      self.logger.error('Error forwarding new series (Change %i) to pacscrawler database!', change['Seq'], exc_info=True)
+    finally:
+      if self.connection is not None:
+        self.connection.close()
+        self.connection = None
+
+  def _get_patient(self, patientTags, change):
+    patientID = patientTags.get('PatientID', None)
+    if patientID is None or patientID == '':
+      self.logger.error('Change %i: Could not find PatientID', change['Seq'])
+      return None
+
+    with self.connection.cursor() as c:
+      c.execute(self.queries['get_patient'], (patientID,))
+      patient = c.fetchone()
+
+      if patient is not None:
+        patient = patient[0]
+      else:
+        patientName = self._filter_nonASCII(patientTags.get('', None))
+        patientGender = patientTags.get('', None)
+        if patientGender == 'F':
+          patientGender = 'V'
+        patientDoB = patientTags.get('', None)
+        if patientDoB == '':
+          patientDoB = None
+        if patientDoB is not None:
+          patientDoB = datetime.datetime.strptime(patientDoB, '%Y%m%d').date()
+        c.execute(self.queries['insert_patient'], (patientName, patientDoB, patientGender))
+        c.execute(self.queries['get_identity_patient'])
+        patient = c.fetchone()[0]  # Get the Database ID for this patient
+        self.logger.debug('Added new patient (DB ID %s)', patient)
+
+        c.execute(self.queries['insert_patientid'], (patientID, patient, None))
+
+      return patient
+
+  def _get_study(self, patient, studyTags, change):
+    studyUID = studyTags.get('StudyInstanceUID', None)
+    if studyUID is None or studyUID == '':
+      self.logger.error('Change %i: Could not find StudyUID', change['Seq'])
+      return None
+
+    with self.connection.cursor() as c:
+      c.execute(self.queries['get_study'], (studyUID,))
+      study = c.fetchone()
+      if study is not None:
+        study = study[0]
+      else:
+        studyDate = studyTags.get('StudyDate', None)
+        if studyDate == '':
+          studyDate = None
+        elif studyDate is not None:
+          studyDate = datetime.datetime.strptime(studyDate, '%Y%m%d').date()
+        studyDescription = studyTags.get('StudyDescription', None)
+        referringPhysician = studyTags.get('ReferringPhysicianName', None)
+        institution = studyTags.get('InstitutionName', None)
+
+        accessionNumber = studyTags.get('AccessionNumber', None)
+
+        c.execute(self.queries['insert_study'], (patient,
+                                                 studyDate,
+                                                 None,
+                                                 None,
+                                                 studyDescription,
+                                                 institution,
+                                                 referringPhysician))
+        c.execute(self.queries['get_identity_study'])
+        study = c.fetchone()[0]
+
+        self.logger.debug('Added new study (DB ID %s)', study)
+
+        c.execute(self.queries['insert_study_keys'], (study, studyUID, accessionNumber))
+
+      return study
+
+  def _get_series(self, study, seriesTags, change):
+    seriesUID = seriesTags.get('SeriesInstanceUID', None)
+    if seriesUID is None or seriesUID == '':
+      self.logger.error('Change %i: Could not find PatientID', change['Seq'])
+      return None
+
+    with self.connection.cursor() as c:
+      c.execute(self.queries['get_series'], (seriesUID,))
+      series = c.fetchone()
+
+      if series is not None:
+        series = series[0]
+      else:
+        modality = seriesTags.get('Modality', None)
+        seriesNumber = seriesTags.get('SeriesNumber', None)
+        if seriesNumber == '':
+          seriesNumber = None
+        elif seriesNumber is not None:
+          seriesNumber = int(seriesNumber)
+        seriesDescription = self._filter_nonASCII(seriesTags.get('SeriesDescription', None))
+        bodyPart = self._filter_nonASCII(seriesTags.get('BodyPartExamined', None))
+
+        c.execute(self.queries['insert_series'], (study, None, modality, seriesNumber, seriesDescription, bodyPart))
+        c.execute(self.queries['get_identity_series'])
+        series = c.fetchone()[0]
+        self.logger.info('Added new series to pacsCrawler (DB ID %s)', series)
+
+        c.execute(self.queries['insert_series_keys'], (series, study, seriesUID))
+      return series
+
+  def _filter_nonASCII(self, value):
+    if value is None:
+      return None
+    value = str(value)
+    res = value
+    for c in value:
+      if re.match('[^\x20-\x7e]', c) is not None:
+        res = res.replace(c, '_')
+    return res
+
+
 def config_logger(**log_config):
   global Logger, UIDlogger
 
-  rootLogger = logging.getLogger('sedi_forward')
+  rootLogger = logging.getLogger('orthanc_forward')
 
   try:
     log_level = getattr(logging, log_config.get('Level', 'WARNING'))
@@ -123,7 +317,7 @@ def config_logger(**log_config):
 
 
 def main(argv=None):
-  global ACCEPTED_MODALITIES, ACCEPTED_SOP_CLASSES, DEBUG_MODE, LAST_CHANGE, CONFIG_FILE
+  global ACCEPTED_MODALITIES, ACCEPTED_SOP_CLASSES, DEBUG_MODE, LAST_CHANGE, CONFIG_FILE, pacscrawlerdb
   config = None
   parser = argparse.ArgumentParser()
   parser.add_argument('config', metavar='CONFIG_FILE', help='JSON configuration file for controlling OrthancForward')
@@ -159,6 +353,13 @@ def main(argv=None):
   LAST_CHANGE = config.get('Last', 0)
 
   Logger.debug('Loaded and checked settings: %s', config)
+
+  if "Database_Connection" in config:
+    try:
+      pacscrawlerdb = PacsCrawlerInterface(**config)
+      Logger.info('Initalized PacsCrawler Interface')
+    except Exception:
+      pacscrawlerdb = None
 
   try:
     run(**config)
@@ -208,13 +409,13 @@ def run(**config):
         if change.get('ChangeType', '') == 'NewSeries':
           Logger.debug('Found new series: %s', change['ID'])
           series = interface.getResponse('/series/%s' % change['ID'])
-  
+
           if 'Modality' not in series['MainDicomTags']:
             Logger.warning('could not find Modality in series %s, skipping...', change['ID'])
             continue
-  
+
           modality = series['MainDicomTags']['Modality']
-          
+
           if accepted_modalities is not None and modality not in accepted_modalities:
             Logger.info('New Series (%s) had modality %s, skipping...', change['ID'], modality)
             continue
@@ -233,19 +434,22 @@ def run(**config):
               if tags['SOPClassUID'] not in accepted_sop_classes:
                 Logger.info('New Series (%s) had SOP class %s, skipping...', change['ID'], tags['SOPClassUID'])
                 continue
-            
+
             # Everything checks out, so let's try to send it to our destionation shall we?
             curSeries = change['ID']
 
             if DEBUG_MODE:
               # Unless you're debugging of course... just write it out to the log
-              Logger.info('<DEBUGGING> pretending to send slice (ID: %s) from study %s to %s', slice_id, change['ID'], target)
+              Logger.info('<DEBUGGING> Change %i: pretending to send slice (ID: %s) from study %s to %s', change['Seq'], slice_id, change['ID'], target)
               UIDlogger.info(series['MainDicomTags']['SeriesInstanceUID'])  # Log UID separately
             else:
               Logger.info('Sending slice (ID: %s) from study %s to %s', slice_id, change['ID'], target)
               UIDlogger.info(series['MainDicomTags']['SeriesInstanceUID'])  # Log UID separately
               interface.postResponse('/modalities/%s/store' % target, [slice_id])  # Send the slice to the target
-            
+
+            if pacscrawlerdb is not None:
+              pacscrawlerdb.process_new_series(change, series, interface)
+
             http_tries = 0  # Slice sent successfully, so reset the counter
         LAST_CHANGE = curChange  # Successfully processed this change, so increase the LAST_CHANGE counter to preven reprocessing
 
