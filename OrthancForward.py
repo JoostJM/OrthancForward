@@ -157,13 +157,25 @@ class PacsCrawlerInterface:
       self.logger.error('Change %i: Could not find PatientID', change['Seq'])
       return None
 
-    with self.connection.cursor() as c:
-      c.execute(self.queries['get_patient'], (patientID,))
-      patient = c.fetchone()
+    ids = {patientID: True}  # True signifies it must be added
 
-      if patient is not None:
-        patient = patient[0]
-      else:
+    patient = None
+
+    if "$$$" in patientID:
+      otherID =patientID[:patientID.find('$$$')]
+      if otherID.isdigit() and not otherID.startswith('0000'):
+        ids[otherID] = True  # True signifies it must be added
+
+    with self.connection.cursor() as c:
+      for ID in ids:
+        c.execute(self.queries['get_patient'], (patientID,))
+        patient_id = c.fetchone()
+        if patient_id is not None:
+          ids[ID] = False  # Doesn't have to be added anymore
+          if patient is None:
+            patient = patient_id[0]
+
+      if patient is None:
         patientName = self._filter_nonASCII(patientTags.get('', None))
         patientGender = patientTags.get('', None)
         if patientGender == 'F':
@@ -178,7 +190,9 @@ class PacsCrawlerInterface:
         patient = c.fetchone()[0]  # Get the Database ID for this patient
         self.logger.debug('Added new patient (DB ID %s)', patient)
 
-        c.execute(self.queries['insert_patientid'], (patientID, patient, None))
+      for ID in ids:
+        if ids[ID]:
+          c.execute(self.queries['insert_patientid'], (ID, patient, None))
 
       return patient
 
