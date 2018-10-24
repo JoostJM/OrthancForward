@@ -24,6 +24,7 @@ LAST_CHANGE = 0
 DEBUG_MODE = False
 MAX_TRIES = 5
 CONFIG_FILE = None
+CHANGE_FILE = './.last_change'
 
 Logger = logging.getLogger('orthanc_forward.events')
 UIDlogger = logging.getLogger('orthanc_forward.UIDs')
@@ -343,6 +344,7 @@ def main(argv=None):
     CONFIG_FILE = args.config
     with open(args.config) as config_fs:
       config = json.load(config_fs)
+    CHANGE_FILE = os.path.join(os.path.dirname(CONFIG_FILE), './.last_change')
 
   if config is None:
     print('Config not loaded! Exiting')
@@ -364,7 +366,8 @@ def main(argv=None):
     DEBUG_MODE = True
 
   # Check if there is a position holder from earlier runs of this script
-  LAST_CHANGE = config.get('Last', 0)
+  LAST_CHANGE = _loadProgress(CHANGE_FILE, 0)
+  config['Last'] = LAST_CHANGE
 
   Logger.debug('Loaded and checked settings: %s', config)
 
@@ -386,7 +389,7 @@ def main(argv=None):
     exit(-1)
   finally:  # always try to store the last change position if necessary
     if config.get('Last', 0) < LAST_CHANGE:
-      _storeProgress(config)
+      _storeProgress(CHANGE_FILE, LAST_CHANGE)
 
 
 def run(**config):
@@ -474,7 +477,7 @@ def run(**config):
         # Store the current last position in the settings file (in case the program gets killed before progress can be stored)
         if config.get('Last', 0) < LAST_CHANGE:
           Logger.info('Reached last change (for now...)')
-          _storeProgress(config)
+          _storeProgress(CHANGE_FILE, LAST_CHANGE)
         Logger.debug('Last change processed, sleeping for %s seconds', sleep_time)
         time.sleep(sleep_time)  # Sleep for n second(s)
     except HTTPError as httpe:
@@ -521,13 +524,32 @@ def _checkSettings(settings):
   return True
 
 
-def _storeProgress(config):
-  global Logger, LAST_CHANGE, CONFIG_FILE
-  Logger.info('Storing current position in the settings file')
-  config['Last'] = LAST_CHANGE
-  with open(CONFIG_FILE, mode='w') as settings_file_fs:
-    json.dump(config, settings_file_fs, indent=2)
+def _storeProgress(fname, last_change):
+  global Logger
+  Logger.info('Storing current position in file %s', fname)
 
+  with open(fname, mode='w') as change_file_fs:
+    change_file_fs.write(str(last_change))
+
+
+def _loadProgress(fname, default=None):
+  global Logger
+  if not os.path.isfile(fname):
+    Logger.warning('No Changefile detected!')
+    return default
+
+  Logger.info('Loading current position from file %s', fname)
+
+  try:
+    with open(fname, mode='r') as change_file_fs:
+      last_change = int(change_file_fs.read())
+      Logger.debug('Read progress file, last change = %i', last_change)
+      return last_change
+  except (KeyboardInterrupt, SystemExit):
+    raise
+  except:
+    Logger.error('Error reading progress file!', exc_info=True)
+    return default
 
 if __name__ == '__main__':
   main()
